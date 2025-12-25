@@ -132,3 +132,45 @@ class Visualizer:
         """
         self.unique_ids.clear()
         self.counts = {cid: 0 for cid in self.class_ids}
+
+    def draw_plates(self, frame: np.ndarray, tracks: list, track_plate_info: Dict[int, Dict]):
+        """绘制车牌信息到跟踪框上方"""
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+            track_id = track.track_id
+            x1, y1, x2, y2 = map(int, track.to_ltrb())
+            cls = track.get_det_class()
+            if cls not in self.class_ids:
+                continue
+
+            # 获取车牌信息
+            plate_data = track_plate_info.get(track_id)
+            if not plate_data:
+                continue
+
+            # 绘制车牌信息
+            plate_text = f"{plate_data['plate_no']} ({plate_data['color']})"
+            (tw, th), _ = cv2.getTextSize(plate_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            # 位置在跟踪框上方
+            text_x = x1
+            text_y = max(y1 - 20, th + 5)
+            # 绘制背景
+            cv2.rectangle(
+                frame,
+                (text_x, text_y - th - 3),
+                (text_x + tw + 5, text_y + 2),
+                (0, 255, 0),  # 绿色背景标识车牌
+                cv2.FILLED
+            )
+            # 绘制文字
+            cv2.putText(
+                frame,
+                plate_text,
+                (text_x + 2, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),  # 黑色文字
+                1,
+                cv2.LINE_AA
+            )

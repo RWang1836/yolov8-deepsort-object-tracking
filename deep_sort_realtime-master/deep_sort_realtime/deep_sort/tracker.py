@@ -126,126 +126,59 @@ class Tracker:
             np.asarray(features), np.asarray(targets), active_targets
         )
 
-    # def _match(self, detections):
-    #     def gated_metric(tracks, dets, track_indices, detection_indices):
-    #         features = np.array([dets[i].feature for i in detection_indices])
-    #         targets = np.array([tracks[i].track_id for i in track_indices])
-    #         cost_matrix = self.metric.distance(features, targets)
-    #         cost_matrix = linear_assignment.gate_cost_matrix(
-    #             self.kf, cost_matrix, tracks, dets, track_indices, detection_indices, only_position=self.gating_only_position
-    #         )
-    #
-    #         return cost_matrix
-    #
-    #     # Split track set into confirmed and unconfirmed tracks.
-    #     confirmed_tracks = [i for i, t in enumerate(self.tracks) if t.is_confirmed()]
-    #     unconfirmed_tracks = [
-    #         i for i, t in enumerate(self.tracks) if not t.is_confirmed()
-    #     ]
-    #
-    #     # Associate confirmed tracks using appearance features.
-    #     (
-    #         matches_a,
-    #         unmatched_tracks_a,
-    #         unmatched_detections,
-    #     ) = linear_assignment.matching_cascade(
-    #         gated_metric,
-    #         self.metric.matching_threshold,
-    #         self.max_age,
-    #         self.tracks,
-    #         detections,
-    #         confirmed_tracks,
-    #     )
-    #
-    #     # Associate remaining tracks together with unconfirmed tracks using IOU.
-    #     iou_track_candidates = unconfirmed_tracks + [
-    #         k for k in unmatched_tracks_a if self.tracks[k].time_since_update == 1
-    #     ]
-    #     unmatched_tracks_a = [
-    #         k for k in unmatched_tracks_a if self.tracks[k].time_since_update != 1
-    #     ]
-    #     (
-    #         matches_b,
-    #         unmatched_tracks_b,
-    #         unmatched_detections,
-    #     ) = linear_assignment.min_cost_matching(
-    #         iou_matching.iou_cost,
-    #         self.max_iou_distance,
-    #         self.tracks,
-    #         detections,
-    #         iou_track_candidates,
-    #         unmatched_detections,
-    #     )
-    #
-    #     matches = matches_a + matches_b
-    #     unmatched_tracks = list(set(unmatched_tracks_a + unmatched_tracks_b))
-    #     return matches, unmatched_tracks, unmatched_detections
-
     def _match(self, detections):
-        """
-        基于匈牙利算法的跟踪-检测匹配，融合车牌特征
-        """
-
         def gated_metric(tracks, dets, track_indices, detection_indices):
-            """
-            计算跟踪与检测的 gated 距离（融合外观、IOU、车牌）
-            """
-            # 1. 获取特征向量
             features = np.array([dets[i].feature for i in detection_indices])
             targets = np.array([tracks[i].track_id for i in track_indices])
-
-            # 2. 计算原生余弦距离
             cost_matrix = self.metric.distance(features, targets)
-            # 3. 应用门控（剔除距离过大的匹配）
-            cost_matrix = nn_matching.gate_cost_matrix(
-                self.metric, cost_matrix, tracks, dets, track_indices, detection_indices
+            cost_matrix = linear_assignment.gate_cost_matrix(
+                self.kf, cost_matrix, tracks, dets, track_indices, detection_indices, only_position=self.gating_only_position
             )
-
-            # 4. 融合车牌距离（关键修改：关联PlateTracker的plate_tracks）
-            # 注意：需要将PlateTracker的plate_tracks传入（通过全局变量或参数传递，这里提供两种方案）
-            # 方案1：全局变量（简单快捷，适合独立脚本）
-            global plate_tracker
-            for i, track_idx in enumerate(track_indices):
-                track_id = tracks[track_idx].track_id
-                plate_track1 = plate_tracker.plate_tracks.get(track_id)
-                if not plate_track1:
-                    continue
-                for j, det_idx in enumerate(detection_indices):
-                    # 检测框对应的车辆（需提前关联检测框与车牌信息，或临时创建PlateTrack）
-                    # 简化处理：若检测框已识别车牌，直接关联
-                    det = dets[det_idx]
-                    if hasattr(det, 'plate_info') and det.plate_info:
-                        # 为检测框创建临时PlateTrack
-                        temp_plate_track = PlateTrack(None)
-                        temp_plate_track.plate_info = det.plate_info
-                        temp_plate_track.track = det  # 临时绑定检测框
-                        # 计算车牌+IOU距离
-                        plate_iou_dist = plate_track1.calculate_match_distance(temp_plate_track)
-                        # 融合到成本矩阵
-                        cost_matrix[i, j] = 0.5 * cost_matrix[i, j] + 0.5 * plate_iou_dist
 
             return cost_matrix
 
-        # 分割跟踪为确认跟踪和未确认跟踪
+        # Split track set into confirmed and unconfirmed tracks.
         confirmed_tracks = [i for i, t in enumerate(self.tracks) if t.is_confirmed()]
-        unconfirmed_tracks = [i for i, t in enumerate(self.tracks) if not t.is_confirmed()]
+        unconfirmed_tracks = [
+            i for i, t in enumerate(self.tracks) if not t.is_confirmed()
+        ]
 
-        # 1. 匹配确认跟踪与检测
-        matches_a, unmatched_tracks_a, unmatched_detections = nn_matching.min_cost_matching(
-            gated_metric, self.metric.matching_threshold, self.max_iou_distance,
-            self.tracks, detections, confirmed_tracks
+        # Associate confirmed tracks using appearance features.
+        (
+            matches_a,
+            unmatched_tracks_a,
+            unmatched_detections,
+        ) = linear_assignment.matching_cascade(
+            gated_metric,
+            self.metric.matching_threshold,
+            self.max_age,
+            self.tracks,
+            detections,
+            confirmed_tracks,
         )
 
-        # 2. 匹配未确认跟踪与剩余检测
-        matches_b, unmatched_tracks_b, unmatched_detections = nn_matching.min_cost_matching(
-            nn_matching.distance_metric, float('inf'), self.max_iou_distance,
-            self.tracks, detections, unconfirmed_tracks, unmatched_detections
+        # Associate remaining tracks together with unconfirmed tracks using IOU.
+        iou_track_candidates = unconfirmed_tracks + [
+            k for k in unmatched_tracks_a if self.tracks[k].time_since_update == 1
+        ]
+        unmatched_tracks_a = [
+            k for k in unmatched_tracks_a if self.tracks[k].time_since_update != 1
+        ]
+        (
+            matches_b,
+            unmatched_tracks_b,
+            unmatched_detections,
+        ) = linear_assignment.min_cost_matching(
+            iou_matching.iou_cost,
+            self.max_iou_distance,
+            self.tracks,
+            detections,
+            iou_track_candidates,
+            unmatched_detections,
         )
 
-        # 合并结果
         matches = matches_a + matches_b
         unmatched_tracks = list(set(unmatched_tracks_a + unmatched_tracks_b))
-
         return matches, unmatched_tracks, unmatched_detections
 
     def _initiate_track(self, detection):

@@ -4,6 +4,7 @@ detections.py
 Handles object detection using YOLOv8.
 """
 
+import torch
 from ultralytics import YOLO
 import numpy as np
 import logging
@@ -18,7 +19,9 @@ class Detector:
             model_path(str): Path to YOLO weights.
             imgsz(int): Image size (default=640)
         """
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.model = YOLO(model_path)
+        self.model.to(self.device)
         self.class_names = self.model.names
         self.imgsz = imgsz
         self.device = self.model.device

@@ -1,127 +1,284 @@
 """
-tracking_with_plate.py (修改版，关联全局plate_tracker)
+tracking_with_plate.py
 ----------------------
-主脚本：集成车牌识别的车辆跟踪流程
+多目标车辆跟踪（分离车牌检测识别，仅负责跟踪逻辑）
+适配 deep_sort_realtime 库原生接口，支持车牌优先匹配
 """
-import os
-import cv2
-import argparse
+
+from deep_sort_realtime.deepsort_tracker import DeepSort as BaseDeepSort
+from deep_sort_realtime.deep_sort.track import Track
+from deep_sort_realtime.deep_sort.detection import Detection
+from Levenshtein import ratio  # 需安装 python-Levenshtein
+import numpy as np
+from typing import List, Dict, Iterable
 import logging
-import torch
-from detections import Detector
-from tracking import PlateTracker  # 导入修改后的跟踪器
-from utils import Visualizer
-from yolov8_plate_master.detect_rec_plate import load_model as load_plate_detector, \
-                                                  init_model as init_plate_recognizer, \
-                                                  det_rec_plate
+import time  # 确保导入time模块（若已导入可忽略）
 
-# 声明全局plate_tracker，供DeepSORT的gated_metric调用
-global plate_tracker
-plate_tracker = None
 
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-class_ids = [2, 3, 5, 7]  # 仅跟踪车辆类：car, motorcycle, bus, truck
+# 自定义常量：车牌信息在 Detection.others 中的存储键
+LICENSE_KEY = "license_text"
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="带车牌识别的车辆跟踪 (YOLOv8 + DeepSORT)")
-    parser.add_argument("--input", type=str, default="data/crosswalk_traffic.mp4", help="输入视频路径或0(摄像头)")
-    parser.add_argument("--output", type=str, default="output/plate_tracking_output.mp4", help="输出视频路径")
-    parser.add_argument("--yolo_model", type=str, default="Yolo-Weights/yolov8m.pt", help="YOLOv8模型路径")
-    parser.add_argument("--plate_det_model", type=str, default="yolov8-plate-master/weights/yolov8s.pt", help="车牌检测模型")
-    parser.add_argument("--plate_rec_model", type=str, default="yolov8-plate-master/weights/plate_rec_color.pth", help="车牌识别模型")
-    parser.add_argument("--frame_width", type=int, default=640, help="显示宽度(0=不缩放)")
-    parser.add_argument("--conf_thresh", type=float, default=0.4, help="置信度阈值")
-    return parser.parse_args()
+class Tracker:
+    def __init__(self, max_age=90, max_cosine_distance=0.3, n_init=3, license_match_thresh=0.8):
+        """
+        初始化跟踪器
+        Args:
+            max_age: 轨迹最大未更新帧数（超过则标记为过期）
+            max_cosine_distance: 余弦距离匹配阈值（越小匹配越严格）
+            n_init: 轨迹确认所需的连续匹配帧数
+            license_match_thresh: 车牌相似度匹配阈值（0-1，越大匹配越严格）
+        """
+        # 初始化原生 DeepSORT 跟踪器
+        self.base_tracker = BaseDeepSort(
+            max_age=max_age,
+            max_cosine_distance=max_cosine_distance,
+            n_init=n_init
+        )
+        # 车牌匹配阈值
+        self.license_match_thresh = license_match_thresh
+        # 存储轨迹的车牌历史（跨帧关联：track_id -> 最新车牌文本）
+        self.track_licenses = {}
+        # 帧计数（用于调试，与库内帧计数同步）
+        self.frame_count = 0
 
-def main():
-    global plate_tracker
-    args = parse_args()
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    def _raw_dets_to_detections(self, raw_detections, frame, instance_masks=None, others=None):
+        """
+        提炼自 deep_sort_realtime 的 update_tracks 方法
+        实现：raw_detections → 标准 Detection 对象（含格式校验、特征提取、NMS 过滤）
+        完全复用库内原生逻辑，确保接口兼容
+        Args:
+            raw_detections: 库标准格式 List[ Tuple[ [left,top,w,h] , confidence, detection_class] ]
+            frame: 输入帧 (np.ndarray, [H,W,C])
+            instance_masks: 实例掩码（与库内一致，默认None）
+            others: 自定义扩展信息列表（与 raw_detections 长度一致，默认None）
+        Returns:
+            List[Detection]: 库标准 Detection 对象列表（已完成 NMS 过滤）
+        """
+        detections = []
 
-    # 初始化设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"使用设备: {device}")
+        # 步骤1：空值判断与格式校验
+        if len(raw_detections) == 0:
+            return detections
+        if not self.base_tracker.polygon:
+            # 校验 bbox 格式为 [left,top,w,h]，过滤宽/高为 0 的无效检测框
+            assert len(raw_detections[0][0]) == 4, "bbox 格式必须为 [left,top,w,h]"
+            raw_detections = [d for d in raw_detections if d[0][2] > 0 and d[0][3] > 0]
+            if len(raw_detections) == 0:
+                return detections
 
-    # 初始化车辆检测器
-    logging.info("加载YOLOv8车辆检测器...")
-    detector = Detector(args.yolo_model)
+        # 步骤2：批量提取外观特征（复用库内 generate_embeds，效率最优）
+        embeds = self.base_tracker.generate_embeds(
+            frame, raw_detections, instance_masks=instance_masks
+        )
 
-    # 初始化车牌识别模型
-    logging.info("加载车牌检测与识别模型...")
-    plate_det_model = load_plate_detector(args.plate_det_model, device)
-    plate_rec_model = init_plate_recognizer(device, args.plate_rec_model, is_color=True)
+        # 步骤3：构造库标准 Detection 对象（复用库内 create_detections）
+        detections = self.base_tracker.create_detections(
+            raw_detections, embeds, instance_masks=instance_masks, others=others
+        )
 
-    # 初始化带车牌特征的跟踪器（赋值给全局变量）
-    plate_tracker = PlateTracker()
+        # 步骤4：NMS 非极大值抑制（去重重叠度高的检测框）
+        if self.base_tracker.nms_max_overlap < 1.0:
+            boxes = np.array([d.ltwh for d in detections])
+            scores = np.array([d.confidence for d in detections])
+            nms_indices = self.base_tracker.non_max_suppression(
+                boxes, self.base_tracker.nms_max_overlap, scores
+            )
+            detections = [detections[i] for i in nms_indices]
 
-    # 初始化可视化工具
-    visualizer = Visualizer(class_ids, detector.class_names)
+        return detections
 
-    # 打开视频流
-    cap = cv2.VideoCapture(0 if args.input == "0" else args.input)
-    if not cap.isOpened():
-        logging.error(f"无法打开输入: {args.input}")
-        return
+    def _prepare_detections_with_license(self, vehicle_detections: List[Dict], frame: np.ndarray):
+        """
+        外部传入的车辆检测结果 → 构造带车牌的标准 Detection 对象
+        核心：从输入字典中读取车牌信息，绑定到 Detection.others 字段
+        Args:
+            vehicle_detections: 外部传入格式 List[Dict]，包含 'bbox'/'conf'/'class_id'/'license'
+            frame: 输入帧 (np.ndarray, [H,W,C])
+        Returns:
+            List[Detection]: 带车牌属性的标准 Detection 对象列表
+            Dict[int, str]: Detection 索引 → 车牌信息映射（帧内局部使用）
+        """
+        # 步骤1：转换为 deep_sort_realtime 标准 raw_detections 格式，同时收集车牌
+        raw_detections = []
+        license_list = []  # 与 raw_detections 一一对应，存储车牌信息
 
-    # 视频参数
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
+        for det in vehicle_detections:
+            # 解析输入字典中的字段
+            bbox_xyxy = det['bbox']  # 外部传入 (x1,y1,x2,y2) 格式
+            conf = det['conf']
+            cls_id = det['class_id']
+            license_text = det.get('license', "").strip()  # 读取外部已识别的车牌
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+            # 转换 bbox 格式：(x1,y1,x2,y2) → [left,top,w,h]（库要求格式）
+            x1, y1, x2, y2 = bbox_xyxy
+            ltwh = [x1, y1, x2 - x1, y2 - y1]
 
-        # 1. 车辆检测
-        detections = detector.detect(frame, class_ids, args.conf_thresh)
+            # 构造库标准 raw_detections 元素
+            raw_detections.append((ltwh, conf, cls_id))
+            # 收集车牌信息（无车牌则为空字符串）
+            license_list.append(license_text)
 
-        # 2. 对检测到的车辆进行车牌识别
-        plate_results = []
-        for det in detections:
-            # 适配detector.detect的输出格式（x1, y1, w, h, conf, cls）
-            x1, y1, w, h, conf, cls = det
-            x2, y2 = x1 + w, y1 + h
-            vehicle_roi = frame[y1:y2, x1:x2]  # 裁剪车辆区域
-            if vehicle_roi.size == 0:
-                continue
+        # 步骤2：构造自定义扩展信息，绑定车牌到 Detection.others
+        others = [{LICENSE_KEY: lic} for lic in license_list]
+        detections = self._raw_dets_to_detections(raw_detections, frame, others=others)
 
-            # 车牌识别 (返回格式: [{'plate_no': '京A12345', 'plate_color': 'blue', ...}])
-            plates = det_rec_plate(vehicle_roi, vehicle_roi, plate_det_model, plate_rec_model)
-            if plates:
-                plate_results.append({
-                    "vehicle_bbox": (x1, y1, x2, y2),  # 车辆边界框
-                    "plate_info": plates[0]            # 车牌信息
-                })
+        # 步骤3：构建 Detection 索引与车牌的映射（帧内局部使用，避免信息错乱）
+        det_license_map = {}
+        for det_idx, (detection, lic_text) in enumerate(zip(detections, license_list)):
+            det_license_map[det_idx] = lic_text
+            # 额外兜底：确保车牌信息已存入 Detection.others（避免库内逻辑清空该字段）
+            if not hasattr(detection, 'others') or detection.others is None:
+                detection.others = {}
+            detection.others[LICENSE_KEY] = lic_text
 
-        # 3. 关联车牌信息到跟踪器
-        plate_tracker._associate_plate_to_tracks(plate_tracker.tracker.tracks)
+        return detections, det_license_map
 
-        # 4. 融合车牌特征的跟踪更新
-        tracks = plate_tracker.update_tracker(detections, frame, plate_results)
+    def update_tracker(self, vehicle_detections: List[Dict], frame: np.ndarray) -> List[Dict]:
+        """
+        核心跟踪方法：接收带车牌的车辆检测结果，完成车牌优先匹配 + 原生 DeepSORT 跟踪
+        Args:
+            vehicle_detections: 外部传入 List[Dict]，包含 'bbox'(x1,y1,x2,y2)/'conf'/'class_id'/'license'
+            frame: 输入帧 (np.ndarray, [H,W,C])
+        Returns:
+            List[Dict]: 包含 track_id/bbox/class_id/license 的最终轨迹结果
+        """
+        # ===== 新增：初始化总耗时计时 =====
+        total_start = time.perf_counter()
+        step_times = {}  # 记录各步骤耗时
+        step_start = 0
 
-        # 5. 可视化 (绘制跟踪框、ID、车牌信息)
-        visualizer.draw_tracks(frame, tracks, args.conf_thresh)
-        visualizer.draw_plates(frame, tracks, plate_tracker.track_plate_info)  # 绘制车牌
-        visualizer.draw_counts(frame)
-        visualizer.draw_fps(frame)
+        self.frame_count += 1
+        logging.debug(f"Processing frame: {self.frame_count}")
 
-        # 保存与显示
-        out.write(frame)
-        if args.frame_width > 0:
-            scale = args.frame_width / width
-            frame = cv2.resize(frame, (args.frame_width, int(height * scale)))
-        cv2.imshow("车辆跟踪(带车牌识别)", frame)
+        # 步骤1：构造带车牌的标准 Detection 对象（从外部读取车牌，无内部检测逻辑）
+        step_start = time.perf_counter()
+        detections, det_license_map = self._prepare_detections_with_license(vehicle_detections, frame)
+        step_times["1. 构造Detection对象"] = time.perf_counter() - step_start
 
-        if cv2.waitKey(1) in [ord('q'), 27]:
-            break
+        if len(detections) == 0:
+            # 无有效检测框，执行卡尔曼滤波预测后返回空结果
+            step_start = time.perf_counter()
+            self.base_tracker.tracker.predict()
+            step_times["2. 卡尔曼滤波预测（空检测）"] = time.perf_counter() - step_start
 
-    cap.release()
-    out.release()
-    cv2.destroyAllWindows()
-    logging.info(f"处理完成，输出保存至: {args.output}")
+            # 打印空检测场景的耗时
+            total_time = time.perf_counter() - total_start
+            self._print_tracker_step_times(step_times, total_time)
+            return []
 
-if __name__ == "__main__":
-    main()
+        # 步骤2：车牌优先匹配（带车牌的 Detection → 现有已确认轨迹）
+        step_start = time.perf_counter()
+        tracked_tracks = self.base_tracker.tracker.tracks  # 获取当前所有轨迹
+        matched_det_indices = set()  # 记录已通过车牌匹配的 Detection 索引
+        license_matched_tracks = {}  # 记录：track_id → Detection 索引
+
+        for det_idx, (detection, license_text) in enumerate(zip(detections, det_license_map.values())):
+            if not license_text:
+                continue  # 无车牌的 Detection，后续走原生 DeepSORT 匹配
+
+            # 查找最优车牌匹配的轨迹
+            best_track = None
+            max_sim = 0.0
+
+            for track in tracked_tracks:
+                # 跳过未确认/长时间未更新的轨迹（与库内逻辑一致，保证跟踪稳定性）
+                if not track.is_confirmed() or track.time_since_update > 1:
+                    continue
+
+                track_id = track.track_id
+                prev_license = self.track_licenses.get(track_id, "")
+                if not prev_license:
+                    continue  # 轨迹无历史车牌，无法进行车牌匹配
+
+                # 计算车牌文本相似度（Levenshtein 距离，抗字符错位/缺失）
+                sim = ratio(license_text, prev_license)
+                if sim > max_sim and sim >= self.license_match_thresh:
+                    max_sim = sim
+                    best_track = track
+
+            if best_track:
+                # 车牌匹配成功：更新轨迹（复用库内 Track 原生 update 方法）
+                best_track.time_since_update = 0  # 重置未更新帧数，避免轨迹过期
+                # best_track.state = Track.State.Tracked  # 标记为活跃跟踪状态 这行似乎不需要
+                best_track.update(self.base_tracker.tracker.kf, detection)  # 传入标准 Detection 对象，兼容库内接口
+
+                # 记录匹配关系，更新轨迹车牌历史
+                matched_det_indices.add(det_idx)
+                license_matched_tracks[best_track.track_id] = det_idx
+                self.track_licenses[best_track.track_id] = license_text
+        step_times["2. 车牌优先匹配（核心）"] = time.perf_counter() - step_start
+
+        # 步骤3：剩余未匹配的 Detection → 复用 DeepSORT 原生跟踪逻辑
+        step_start = time.perf_counter()
+        remaining_detections = [
+            detections[det_idx] for det_idx in range(len(detections))
+            if det_idx not in matched_det_indices
+        ]
+        step_times["3. 筛选剩余未匹配Detection"] = time.perf_counter() - step_start
+
+        # 库原生跟踪流程：卡尔曼滤波预测 → 匈牙利算法匹配更新
+        step_start = time.perf_counter()
+        self.base_tracker.tracker.predict()
+        self.base_tracker.tracker.update(remaining_detections, today=None)
+        step_times["4. 原生DeepSORT（预测+更新）"] = time.perf_counter() - step_start
+
+        # 步骤4：整合轨迹结果，补充车牌信息，构造外部返回格式
+        step_start = time.perf_counter()
+        result_tracks = []
+        all_tracks = self.base_tracker.tracker.tracks  # 获取所有更新后的轨迹
+
+        for track in all_tracks:
+            if not track.is_confirmed():
+                continue  # 跳过未确认的轨迹（过滤噪声轨迹）
+
+            track_id = track.track_id
+            # 转换 bbox 格式：[left,top,w,h] → (x1,y1,x2,y2)（与外部输入格式一致）
+            ltwh = track.to_ltwh()
+            x1, y1, w, h = ltwh
+            bbox_xyxy = [x1, y1, x1 + w, y1 + h]
+            class_id = track.get_det_class()
+            license_text = ""
+
+            # 优先级1：从车牌匹配结果中获取（最准确）
+            if track_id in license_matched_tracks:
+                det_idx = license_matched_tracks[track_id]
+                license_text = det_license_map.get(det_idx, "")
+            # 优先级2：从原生匹配的 Detection 对象中提取（无车牌匹配时）
+            elif track.get_det_supplementary() is not None:
+                license_text = track.get_det_supplementary().get(LICENSE_KEY, "")
+            # 优先级3：从轨迹历史车牌中补充（车辆暂时未识别到车牌时）
+            if not license_text:
+                license_text = self.track_licenses.get(track_id, "")
+            else:
+                # 更新轨迹历史车牌（保持最新车牌信息）
+                self.track_licenses[track_id] = license_text
+
+            # 构造最终返回结果
+            result_tracks.append({
+                'track_id': track_id,
+                'bbox': bbox_xyxy,
+                'class_id': class_id,
+                'license': license_text.strip()
+            })
+        step_times["5. 整合轨迹结果（补车牌）"] = time.perf_counter() - step_start
+
+        # ===== 新增：打印所有步骤耗时 =====
+        total_time = time.perf_counter() - total_start
+        self._print_tracker_step_times(step_times, total_time)
+
+        return result_tracks
+
+    # ===== 新增：耗时打印辅助方法 =====
+    def _print_tracker_step_times(self, step_times: Dict[str, float], total_time: float):
+        """
+        打印跟踪器各步骤耗时及占比
+        Args:
+            step_times: 步骤名称 → 耗时（秒）
+            total_time: 跟踪器总耗时（秒）
+        """
+        logging.info(f"\n===== 跟踪器（update_tracker）耗时统计（帧{self.frame_count}） =====")
+        logging.info(f"跟踪器总耗时：{total_time:.4f} 秒")
+        for step_name, step_time in step_times.items():
+            ratio = (step_time / total_time) * 100 if total_time > 0.0001 else 0.0
+            logging.info(f"{step_name}：{step_time:.4f} 秒（占比：{ratio:.2f}%）")
+        logging.info("=" * 50)

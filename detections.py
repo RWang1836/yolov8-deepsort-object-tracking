@@ -20,6 +20,7 @@ class Detector:
             imgsz(int): Image size (default=640)
         """
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        # self.device = torch.device("cpu")
         self.model = YOLO(model_path)
         self.model.to(self.device)
         self.class_names = self.model.names

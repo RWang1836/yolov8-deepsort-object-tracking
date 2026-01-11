@@ -26,7 +26,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Vehicle & Pedestrian Tracking with YOLOv8 + DeepSORT")
     parser.add_argument("--input", type=str, default="data/crosswalk_traffic.mp4", help="Path to input video or 0 for webcam")
     parser.add_argument("--output", type=str, default="output/crosswalk_traffic_output.mp4", help="Path to save the output")
-    parser.add_argument("--model", type=str, default="Yolo-Weights/yolov8m.pt", help="Path to YOLOv8 model weights")
+    parser.add_argument("--model", type=str, default="Yolo-Weights/yolov8s.pt", help="Path to YOLOv8 model weights")
     parser.add_argument("--frame_width", type=int, default=640, help="Resize display width (0 = no resize)")
     parser.add_argument("--conf_thresh", type=float, default=0.4, help="Confidence threshold for displaying & counting detections")
     return parser.parse_args()

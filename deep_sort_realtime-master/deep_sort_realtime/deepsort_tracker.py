@@ -190,7 +190,7 @@ class DeepSort(object):
 
         assert isinstance(raw_detections,Iterable)
 
-        if len(raw_detections) > 0: 
+        if len(raw_detections) > 0:
             if not self.polygon:
                 assert len(raw_detections[0][0])==4
                 raw_detections = [d for d in raw_detections if d[0][2] > 0 and d[0][3] > 0]
@@ -210,7 +210,7 @@ class DeepSort(object):
                 detections = self.create_detections_poly(
                     raw_detections, embeds, bounding_rects,
                 )
-        else: 
+        else:
             detections = []
 
         # Run non-maxima suppression.
